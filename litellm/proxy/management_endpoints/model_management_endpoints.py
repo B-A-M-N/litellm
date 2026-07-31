@@ -142,6 +142,48 @@ def _raise_on_strategy_router_write_violation(
     )
 
 
+_PTU_MODEL_INFO_FIELDS = ("ptu_count", "cost_per_ptu_per_hour", "ptu_effective_from", "ptu_effective_to")
+
+
+def _validate_ptu_model_info(model_info: Mapping[str, object]) -> None:
+    """Enforce the PTU cross-field invariant on the effective model_info.
+
+    ptu_count and cost_per_ptu_per_hour must be set together, and a team_id is
+    required when they are (one model maps to one team). Per-field bounds
+    (positive count, non-negative rate) are enforced by ModelInfo itself.
+    """
+    has_count = model_info.get("ptu_count") is not None
+    has_rate = model_info.get("cost_per_ptu_per_hour") is not None
+    if not has_count and not has_rate:
+        return
+    if has_count != has_rate:
+        raise HTTPException(status_code=400, detail="ptu_count and cost_per_ptu_per_hour must be set together")
+    if not model_info.get("team_id"):
+        raise HTTPException(
+            status_code=400, detail="team_id is required when PTU fields are set (one model maps to one team)"
+        )
+    effective_from = _coerce_ptu_datetime(model_info.get("ptu_effective_from"))
+    effective_to = _coerce_ptu_datetime(model_info.get("ptu_effective_to"))
+    if effective_from is not None and effective_to is not None and effective_to <= effective_from:
+        raise HTTPException(status_code=400, detail="ptu_effective_to must be after ptu_effective_from")
+
+
+def _coerce_ptu_datetime(value: object) -> datetime.datetime | None:
+    """Coerce a model_info effective-window value (datetime or ISO string) to UTC, else None."""
+    if isinstance(value, datetime.datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
 def update_db_model(db_model: Deployment, updated_patch: updateDeployment) -> PrismaCompatibleUpdateDBModel:
     merged_deployment_dict = DeploymentTypedDict(
         model_name=db_model.model_name,
@@ -188,6 +230,9 @@ def update_db_model(db_model: Deployment, updated_patch: updateDeployment) -> Pr
             if field in SPECIAL_MODEL_INFO_PARAMS and getattr(updated_patch.model_info, field) is None:
                 merged_deployment_dict["model_info"].pop(field, None)  # type: ignore
                 merged_deployment_dict.get("litellm_params", {}).pop(field, None)  # type: ignore
+        for field in _PTU_MODEL_INFO_FIELDS:
+            if field in updated_patch.model_info.model_fields_set and getattr(updated_patch.model_info, field) is None:
+                merged_deployment_dict["model_info"].pop(field, None)
 
     # convert to prisma compatible format
 
@@ -200,6 +245,7 @@ def update_db_model(db_model: Deployment, updated_patch: updateDeployment) -> Pr
 
     if "model_info" in merged_deployment_dict:
         model_info = merged_deployment_dict["model_info"]
+        _validate_ptu_model_info(model_info)
         for key, value in model_info.items():
             if isinstance(value, datetime.datetime):
                 model_info[key] = value.isoformat()
@@ -1348,6 +1394,8 @@ async def add_new_model(
 
         model_response: Optional[LiteLLM_ProxyModelTable] = None
         # update DB
+        _validate_ptu_model_info(model_params.model_info.model_dump(exclude_none=True))
+
         if store_model_in_db is True:
             """
             - store model_list in db
