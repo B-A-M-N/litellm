@@ -107,6 +107,24 @@ def test_is_database_connection_generic_errors():
     )
 
 
+def test_prisma_classifiers_without_optional_dependency(monkeypatch):
+    monkeypatch.setitem(sys.modules, "prisma", None)
+
+    generic_error = ValueError("invalid key")
+    db_proxy_exception = ProxyException(
+        message="DB Connection Error",
+        type=ProxyErrorTypes.no_db_connection,
+        param="test-param",
+    )
+
+    assert PrismaDBExceptionHandler.is_database_connection_error(generic_error) is False
+    assert PrismaDBExceptionHandler.is_prisma_data_error(generic_error) is False
+    assert PrismaDBExceptionHandler.is_database_transport_error(generic_error) is False
+    assert PrismaDBExceptionHandler.is_prisma_engine_internal_error(generic_error) is False
+    assert PrismaDBExceptionHandler.is_database_connection_error(db_proxy_exception) is True
+    assert PrismaDBExceptionHandler.is_database_transport_error(db_proxy_exception) is True
+
+
 @pytest.mark.parametrize(
     "error",
     [
